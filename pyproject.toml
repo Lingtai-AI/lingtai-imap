@@ -1,0 +1,19 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lingtai-imap"
+version = "0.1.0"
+description = "LingTai IMAP MCP server — real email via IMAP/SMTP."
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "imapclient>=3.0.0",
+]
+
+[project.scripts]
+lingtai-imap = "lingtai_imap.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lingtai_imap"]

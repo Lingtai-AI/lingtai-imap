@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build / packaging
+build/
+dist/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Environments
+.env
+.venv/
+venv/
+
+# Secrets — config files with real credentials never get committed
+.secrets/
