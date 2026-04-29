@@ -6,11 +6,19 @@ build-backend = "hatchling.build"
 name = "lingtai-imap"
 version = "0.1.0"
 description = "LingTai IMAP MCP server — real email via IMAP/SMTP."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Zesen Huang", email = "hzsbazinga@outlook.com" }]
 requires-python = ">=3.10"
 dependencies = [
     "mcp>=1.0.0",
     "imapclient>=3.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Lingtai-AI/lingtai-imap"
+Repository = "https://github.com/Lingtai-AI/lingtai-imap"
+"LingTai" = "https://lingtai.ai"
 
 [project.scripts]
 lingtai-imap = "lingtai_imap.__main__:main"
