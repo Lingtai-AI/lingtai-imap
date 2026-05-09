@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "lingtai-imap"
 version = "0.1.0"
-description = "LingTai IMAP MCP server — real email via IMAP/SMTP."
+description = "LingTai IMAP MCP server"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [{ name = "Zesen Huang", email = "hzsbazinga@outlook.com" }]
