@@ -17,6 +17,7 @@ import mimetypes
 import re
 import smtplib
 import socket
+import ssl
 import threading
 import time
 from email import encoders
@@ -241,11 +242,77 @@ class IMAPAccount:
                 pass
             self._tool_imap = None
 
+    # Transient lower-layer errors that mean "socket is dead, reconnect."
+    # ``IMAPClientError`` is bound to ``imaplib.IMAP4.error`` and therefore
+    # also catches ``imaplib.IMAP4.abort`` and ``IMAPClientAbortError``.
+    # ``ssl.SSLError`` and ``socket.error`` are both subclasses of
+    # ``OSError``; listing them explicitly documents intent and survives
+    # any future divergence in the stdlib class hierarchy.
+    _TRANSIENT_IMAP_ERRORS = (
+        socket.error,
+        OSError,
+        ssl.SSLError,
+        IMAPClientError,
+    )
+
     def _ensure_connected(self) -> IMAPClient:
+        """Return a live tool-call IMAPClient.
+
+        Callers must already hold ``self._lock``. A cached client is probed
+        with NOOP before being handed back; if NOOP raises (Gmail closed
+        the socket after a long idle, SSL EOF, etc.) the client is
+        discarded and a fresh one is opened.
+        """
+        if self._tool_imap is not None:
+            try:
+                self._tool_imap.noop()
+                return self._tool_imap
+            except self._TRANSIENT_IMAP_ERRORS as e:
+                logger.info(
+                    "imap %s: cached tool connection is dead (%s); "
+                    "reconnecting", self._email_address, e,
+                )
+                self._drop_tool_imap()
         if self._tool_imap is None:
             self.connect()
         assert self._tool_imap is not None
         return self._tool_imap
+
+    def _drop_tool_imap(self) -> None:
+        """Best-effort close + clear the cached tool-call client."""
+        client = self._tool_imap
+        self._tool_imap = None
+        if client is None:
+            return
+        try:
+            client.logout()
+        except Exception:
+            pass
+
+    def _with_reconnect(self, op):
+        """Run ``op(imap)`` against the tool connection with retry-once.
+
+        ``op`` is a callable that receives a live ``IMAPClient`` and does
+        all of its own SELECT / SEARCH / FETCH / STORE work. If the call
+        fails with a transient socket/SSL/IMAP error the cached client is
+        dropped, a fresh one is opened, and ``op`` is invoked exactly one
+        more time. A second failure propagates.
+
+        Callers MUST already hold ``self._lock``; this helper does not
+        acquire it. Long-running ops like SMTP send are intentionally
+        excluded — only call this for read/write IMAP work.
+        """
+        imap = self._ensure_connected()
+        try:
+            return op(imap)
+        except self._TRANSIENT_IMAP_ERRORS as e:
+            logger.info(
+                "imap %s: transient error (%s); reconnecting and retrying",
+                self._email_address, e,
+            )
+            self._drop_tool_imap()
+            imap = self._ensure_connected()
+            return op(imap)
 
     def _fetch_capabilities(self) -> None:
         assert self._tool_imap is not None
@@ -291,17 +358,19 @@ class IMAPAccount:
 
     def fetch_envelopes(self, folder: str, n: int = 20) -> list[dict]:
         """Return headers for the N most recent UIDs in `folder`."""
-        with self._lock:
-            imap = self._ensure_connected()
+        def _op(imap):
             imap.select_folder(folder, readonly=True)
             all_uids = imap.search("ALL")
             if not all_uids:
-                return []
+                return {}
             recent = all_uids[-n:] if n > 0 else all_uids
-            data = imap.fetch(
+            return imap.fetch(
                 recent,
                 ["FLAGS", "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)]"],
             )
+
+        with self._lock:
+            data = self._with_reconnect(_op)
         return [self._envelope_from_fetch(uid, info, folder)
                 for uid, info in sorted(data.items())]
 
@@ -312,10 +381,16 @@ class IMAPAccount:
         if not uids:
             return []
         int_uids = [int(u) for u in uids]
-        with self._lock:
-            imap = self._ensure_connected()
+
+        def _op(imap):
             imap.select_folder(folder, readonly=True)
-            data = imap.fetch(int_uids, ["FLAGS", "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)]"])
+            return imap.fetch(
+                int_uids,
+                ["FLAGS", "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)]"],
+            )
+
+        with self._lock:
+            data = self._with_reconnect(_op)
         return [self._envelope_from_fetch(uid, info, folder)
                 for uid, info in sorted(data.items())]
 
@@ -345,10 +420,13 @@ class IMAPAccount:
     def fetch_full(self, folder: str, uid: str) -> dict | None:
         """Fetch the full message for a single UID."""
         uid_int = int(uid)
-        with self._lock:
-            imap = self._ensure_connected()
+
+        def _op(imap):
             imap.select_folder(folder, readonly=True)
-            data = imap.fetch([uid_int], ["FLAGS", "RFC822"])
+            return imap.fetch([uid_int], ["FLAGS", "RFC822"])
+
+        with self._lock:
+            data = self._with_reconnect(_op)
         info = data.get(uid_int)
         if not info:
             return None
@@ -391,31 +469,67 @@ class IMAPAccount:
     def search(self, folder: str, query: str) -> list[str]:
         """Server-side IMAP SEARCH with our DSL."""
         criteria = self._build_search_criteria(query)
-        with self._lock:
-            imap = self._ensure_connected()
+
+        def _op(imap):
             imap.select_folder(folder, readonly=True)
-            uids = imap.search(criteria)
+            return imap.search(criteria)
+
+        with self._lock:
+            uids = self._with_reconnect(_op)
         return [str(u) for u in uids]
+
+    # Bare bool keywords with no value, e.g. ``unseen`` on its own.
+    _BARE_FLAGS = {
+        "flagged": b"FLAGGED",
+        "unseen": b"UNSEEN",
+        "seen": b"SEEN",
+    }
+
+    # Tokeniser order matters: ``key:"quoted"`` and ``key:value`` must be
+    # tried before bare ``"quoted phrase"`` and bare ``token``, otherwise
+    # ``from:"a b"`` would be split into key+bare.
+    _SEARCH_TOKEN_RE = re.compile(
+        r'(\w+):"([^"]+)"'   # key:"quoted value"   → grp 0,1
+        r'|(\w+):(\S+)'      # key:value            → grp 2,3
+        r'|"([^"]+)"'        # "bare quoted phrase" → grp 4
+        r'|(\S+)',           # bare token           → grp 5
+    )
 
     @staticmethod
     def _build_search_criteria(query: str) -> list[bytes]:
         """Translate our query DSL into imapclient SEARCH criteria.
 
-        Supports: from:<addr> subject:<text> since:YYYY-MM-DD
-                  before:YYYY-MM-DD flagged unseen seen
-        Multiple terms AND-ed.
+        Recognised keys:
+            from:<addr> to:<addr> subject:<text>
+            since:YYYY-MM-DD before:YYYY-MM-DD
+            flagged unseen seen
+        Anything that isn't a recognised key (a bare word or a bare
+        ``"quoted phrase"``) becomes a ``TEXT`` clause so the server
+        actually searches for it instead of silently returning every
+        message in the folder. Multiple clauses are implicitly AND-ed by
+        IMAP. A truly empty query still compiles to ``ALL``.
         """
         from datetime import datetime
         criteria: list[bytes] = []
-        # Split on whitespace, but keep "key:value" tokens together
-        tokens = re.findall(r'(\w+):"([^"]+)"|(\w+):(\S+)|(\S+)', query.strip())
-        for grp in tokens:
-            if grp[0] and grp[1]:
-                key, val = grp[0].lower(), grp[1]
-            elif grp[2] and grp[3]:
-                key, val = grp[2].lower(), grp[3]
+        for grp in IMAPAccount._SEARCH_TOKEN_RE.findall(query.strip()):
+            kv_key_q, kv_val_q, kv_key, kv_val, bare_q, bare = grp
+            if kv_key_q and kv_val_q:
+                key, val = kv_key_q.lower(), kv_val_q
+            elif kv_key and kv_val:
+                key, val = kv_key.lower(), kv_val
+            elif bare_q:
+                criteria += [b"TEXT", bare_q.encode()]
+                continue
+            elif bare:
+                bare_lc = bare.lower()
+                if bare_lc in IMAPAccount._BARE_FLAGS:
+                    criteria.append(IMAPAccount._BARE_FLAGS[bare_lc])
+                else:
+                    criteria += [b"TEXT", bare.encode()]
+                continue
             else:
-                key, val = grp[4].lower(), ""
+                continue
+
             if key == "from" and val:
                 criteria += [b"FROM", val.encode()]
             elif key == "to" and val:
@@ -442,12 +556,6 @@ class IMAPAccount:
                     )
                     continue
                 criteria += [b"BEFORE", d.strftime("%d-%b-%Y").encode()]
-            elif key == "flagged":
-                criteria.append(b"FLAGGED")
-            elif key == "unseen":
-                criteria.append(b"UNSEEN")
-            elif key == "seen":
-                criteria.append(b"SEEN")
         return criteria or [b"ALL"]
 
     def store_flags(
@@ -465,18 +573,24 @@ class IMAPAccount:
                 "imap store_flags: unknown action %r, refusing", action,
             )
             return False
-        with self._lock:
-            imap = self._ensure_connected()
+
+        def _op(imap):
             imap.select_folder(folder)
+            if action == "+FLAGS":
+                imap.add_flags([int(uid)], flag_bytes)
+            elif action == "-FLAGS":
+                imap.remove_flags([int(uid)], flag_bytes)
+            else:
+                imap.set_flags([int(uid)], flag_bytes)
+
+        with self._lock:
             try:
-                if action == "+FLAGS":
-                    imap.add_flags([int(uid)], flag_bytes)
-                elif action == "-FLAGS":
-                    imap.remove_flags([int(uid)], flag_bytes)
-                else:
-                    imap.set_flags([int(uid)], flag_bytes)
+                self._with_reconnect(_op)
                 return True
             except IMAPClientError:
+                # Server-rejected flag change (permission, unknown flag,
+                # etc.) — distinct from a dead socket. Already swallowed
+                # by the original implementation.
                 return False
 
     def mark_seen(self, folder: str, uid: str) -> bool:
@@ -492,27 +606,29 @@ class IMAPAccount:
         return {k: v for k, v in self._folders.items() if v is not None}
 
     def move_message(self, folder: str, uid: str, dest_folder: str) -> bool:
-        with self._lock:
-            imap = self._ensure_connected()
+        def _op(imap):
             imap.select_folder(folder)
-            try:
-                if self._has_move:
-                    imap.move([int(uid)], dest_folder)
+            if self._has_move:
+                imap.move([int(uid)], dest_folder)
+            else:
+                imap.copy([int(uid)], dest_folder)
+                imap.add_flags([int(uid)], [b"\\Deleted"])
+                if self._has_uidplus:
+                    imap.uid_expunge([int(uid)])
                 else:
-                    imap.copy([int(uid)], dest_folder)
-                    imap.add_flags([int(uid)], [b"\\Deleted"])
-                    if self._has_uidplus:
-                        imap.uid_expunge([int(uid)])
-                    else:
-                        # No UIDPLUS — bare EXPUNGE removes ALL \Deleted msgs
-                        # in this folder. Acceptable risk only because the
-                        # server lacks both MOVE and UIDPLUS, which is rare.
-                        logger.warning(
-                            "imap: %s lacks MOVE+UIDPLUS; EXPUNGE may "
-                            "affect other \\Deleted messages",
-                            self._email_address,
-                        )
-                        imap.expunge()
+                    # No UIDPLUS — bare EXPUNGE removes ALL \Deleted msgs
+                    # in this folder. Acceptable risk only because the
+                    # server lacks both MOVE and UIDPLUS, which is rare.
+                    logger.warning(
+                        "imap: %s lacks MOVE+UIDPLUS; EXPUNGE may "
+                        "affect other \\Deleted messages",
+                        self._email_address,
+                    )
+                    imap.expunge()
+
+        with self._lock:
+            try:
+                self._with_reconnect(_op)
                 return True
             except IMAPClientError as e:
                 logger.warning("move failed: %s", e)
@@ -522,20 +638,23 @@ class IMAPAccount:
         trash = self.get_folder_by_role("trash")
         if trash and folder != trash:
             return self.move_message(folder, uid, trash)
-        with self._lock:
-            imap = self._ensure_connected()
+
+        def _op(imap):
             imap.select_folder(folder)
+            imap.add_flags([int(uid)], [b"\\Deleted"])
+            if self._has_uidplus:
+                imap.uid_expunge([int(uid)])
+            else:
+                logger.warning(
+                    "imap: %s lacks UIDPLUS; EXPUNGE may affect "
+                    "other \\Deleted messages",
+                    self._email_address,
+                )
+                imap.expunge()
+
+        with self._lock:
             try:
-                imap.add_flags([int(uid)], [b"\\Deleted"])
-                if self._has_uidplus:
-                    imap.uid_expunge([int(uid)])
-                else:
-                    logger.warning(
-                        "imap: %s lacks UIDPLUS; EXPUNGE may affect "
-                        "other \\Deleted messages",
-                        self._email_address,
-                    )
-                    imap.expunge()
+                self._with_reconnect(_op)
                 return True
             except IMAPClientError:
                 return False
@@ -631,9 +750,10 @@ class IMAPAccount:
 
         with self._reconcile_lock:
             with self._lock:
-                imap = self._ensure_connected()
-                status = imap.folder_status(
-                    folder, [b"UIDVALIDITY", b"UIDNEXT"],
+                status = self._with_reconnect(
+                    lambda imap: imap.folder_status(
+                        folder, [b"UIDVALIDITY", b"UIDNEXT"],
+                    ),
                 )
             uidvalidity = int(status[b"UIDVALIDITY"])
             uidnext = int(status[b"UIDNEXT"])
@@ -671,10 +791,13 @@ class IMAPAccount:
 
             # Normal path
             last = int(folder_state["last_delivered_uid"])
-            with self._lock:
-                imap = self._ensure_connected()
+
+            def _search_uids(imap):
                 imap.select_folder(folder, readonly=True)
-                new_uids = imap.search([b"UID", f"{last+1}:*".encode()])
+                return imap.search([b"UID", f"{last+1}:*".encode()])
+
+            with self._lock:
+                new_uids = self._with_reconnect(_search_uids)
             # IMAP semantics: when range start > UIDNEXT the server returns
             # the highest existing UID. Filter that out.
             new_uids = [u for u in new_uids if int(u) > last]
@@ -697,16 +820,18 @@ class IMAPAccount:
         SELECT + SEARCH + FETCH all run inside one lock scope so a
         concurrent tool-call cannot select a different folder mid-flight.
         """
-        with self._lock:
-            imap = self._ensure_connected()
+        def _op(imap):
             imap.select_folder(folder, readonly=True)
             uids = imap.search(b"UNSEEN")
             if not uids:
-                return []
-            data = imap.fetch(
+                return {}
+            return imap.fetch(
                 uids,
                 ["FLAGS", "BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE)]"],
             )
+
+        with self._lock:
+            data = self._with_reconnect(_op)
         return [self._envelope_from_fetch(uid, info, folder)
                 for uid, info in sorted(data.items())]
 
