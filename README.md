@@ -10,6 +10,36 @@ This is the canonical setup, configuration, and troubleshooting doc for the `lin
 
 One omnibus MCP tool: `imap(action=...)`. Actions: `send`, `check`, `read`, `reply`, `search`, `delete`, `move`, `flag`, `folders`, `contacts`, `add_contact`, `remove_contact`, `edit_contact`, `accounts`. Email IDs are compound keys: `account:folder:uid`.
 
+
+## LingTai profile resources
+
+`lingtai-imap` is a normal MCP server, but it also publishes a small
+LingTai-specific profile through ordinary MCP resources. This keeps the addon
+self-contained: configuration docs, troubleshooting, pointer-skill text, and
+runtime status live with the MCP package instead of being copied into LingTai's
+TUI or bundled skills.
+
+Resources:
+
+| URI | MIME type | Purpose |
+|---|---|---|
+| `lingtai://manifest` | `application/vnd.lingtai.mcp-profile+json` | Machine-readable LingTai profile: server metadata, resource index, ownership boundaries, agent entrypoints, and safe runtime status. |
+| `lingtai://skills/imap` | `text/markdown; profile=lingtai-skill` | Thin routing/pointer skill. Existing LingTai addon skills can point here rather than duplicating platform details. |
+| `lingtai://docs/configuration` | `text/markdown` | Authoritative config schema and setup notes. |
+| `lingtai://docs/troubleshooting` | `text/markdown` | Common startup, delivery, and SMTP failure diagnostics. |
+| `lingtai://status` | `application/json` | Current account/listener state with passwords and raw config omitted. |
+
+Boundary:
+
+- `/mcp` is the human-facing LingTai TUI/control-panel surface for viewing MCP
+  configuration, status, resources, and onboarding.
+- Agents should use MCP tools/resources/prompts directly. For IMAP, that means
+  using the `imap(action=...)` tool for mail operations and reading the
+  `lingtai://...` resources for documentation/status.
+- Existing LingTai addon skills should remain as thin progressive-disclosure
+  pointers toward this MCP, not as the authoritative copy of changing provider
+  details.
+
 ## Inbound mail (LICC)
 
 Inbound IMAP messages flow into the host agent's inbox via the LingTai Inbox Callback Contract. The server reads two env vars that the LingTai kernel injects automatically when spawning the MCP:
