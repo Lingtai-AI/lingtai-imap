@@ -134,3 +134,9 @@ Then run `system(action="refresh")` from the agent. The MCP subprocess starts, t
 ## License
 
 MIT.
+
+
+## Onboarding resources
+
+- `lingtai://onboarding/imap` — IMAP/SMTP setup workflow, provider caveats, and verification checklist.
+- `lingtai://onboarding/html-template` — static secret-free HTML checklist template for local browser presentation.

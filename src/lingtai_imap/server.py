@@ -73,6 +73,8 @@ _SKILL_URI = "lingtai://skills/imap"
 _CONFIG_DOC_URI = "lingtai://docs/configuration"
 _TROUBLESHOOTING_DOC_URI = "lingtai://docs/troubleshooting"
 _STATUS_URI = "lingtai://status"
+_ONBOARDING_URI = "lingtai://onboarding/imap"
+_ONBOARDING_HTML_TEMPLATE_URI = "lingtai://onboarding/html-template"
 
 
 def _package_version() -> str:
@@ -159,7 +161,11 @@ def lingtai_profile(manager: IMAPMailManager | None = None) -> dict[str, Any]:
                     _CONFIG_DOC_URI,
                     _TROUBLESHOOTING_DOC_URI,
                     _STATUS_URI,
+                    _ONBOARDING_URI,
+                    _ONBOARDING_HTML_TEMPLATE_URI,
                 ],
+                "onboarding": _ONBOARDING_URI,
+                "onboarding_html_template": _ONBOARDING_HTML_TEMPLATE_URI,
             },
         },
         "resources": [
@@ -193,6 +199,18 @@ def lingtai_profile(manager: IMAPMailManager | None = None) -> dict[str, Any]:
                 "mime_type": JSON_MIME,
                 "description": "Current account/listener status with secrets omitted.",
             },
+            {
+                "uri": _ONBOARDING_URI,
+                "name": "imap onboarding",
+                "mime_type": MARKDOWN_MIME,
+                "description": "Agent-facing IMAP/SMTP setup workflow and verification checklist.",
+            },
+            {
+                "uri": _ONBOARDING_HTML_TEMPLATE_URI,
+                "name": "imap onboarding HTML template",
+                "mime_type": "text/html",
+                "description": "Secret-free local HTML checklist template for IMAP onboarding.",
+            },
         ],
         "status": _safe_status_payload(manager),
     }
@@ -223,6 +241,7 @@ runtime status, diagnostics, and troubleshooting.
 - Read `lingtai://docs/troubleshooting` when the addon does not start or mail
   does not arrive.
 - Read `lingtai://status` for current account/listener state.
+- Read `lingtai://onboarding/imap` when guiding a human through first-time setup.
 
 ## Human route
 
@@ -320,6 +339,116 @@ copy config files into chat or issues without redacting secrets.
 """
 
 
+def _onboarding_markdown() -> str:
+    return """# lingtai-imap onboarding
+
+This onboarding surface is intentionally MCP-owned. LingTai's `/mcp` UI may render it,
+but agents should read this resource directly when helping a human connect real email.
+
+IMAP setup is simpler than chat addons: there is no QR scan, no webhook, and no
+platform callback. The job is to collect provider settings, write the config, refresh
+the host agent, and verify both inbound IMAP and outbound SMTP.
+
+## Prerequisites
+
+Ask the human which mailbox provider they want to connect and whether the mailbox is
+allowed to send/receive automation traffic.
+
+Common provider notes:
+
+- Gmail / Google Workspace: enable IMAP and use an app password or OAuth/app token.
+  A normal account password usually will not work when 2FA is enabled.
+- Outlook / Microsoft 365: use the provider's current IMAP/SMTP host/port/TLS
+  settings; many tenants disable basic auth and require an app-specific token or
+  OAuth-style credential.
+- Custom domains: confirm the IMAP and SMTP hostnames, ports, and TLS mode from the
+  mail host's documentation.
+
+## Minimal config
+
+Write a JSON file and point `LINGTAI_IMAP_CONFIG` at it:
+
+```json
+{
+  "accounts": [
+    {
+      "email_address": "agent@example.com",
+      "email_password": "app-password-or-provider-token",
+      "imap_host": "imap.example.com",
+      "imap_port": 993,
+      "smtp_host": "smtp.example.com",
+      "smtp_port": 587,
+      "allowed_senders": ["trusted@example.com"],
+      "poll_interval": 30
+    }
+  ]
+}
+```
+
+Do not paste real passwords into chat, issues, or generated HTML. Store them only in
+the agent's secret/config file according to the local LingTai deployment convention.
+
+## Verification checklist
+
+1. Refresh/restart the host agent after config changes.
+2. Read `lingtai://status`; confirm `manager_initialized: true` and the account is
+   listed. Status is secret-redacted by design.
+3. Run `imap(action="accounts")`; confirm the account and listener fields look sane.
+4. Send a test email from an allowed sender to the configured mailbox.
+5. Run `imap(action="check", n=5)` or wait for the MCP notification.
+6. Send a test outbound message with `imap(action="send", ...)` to confirm SMTP.
+7. If inbound works but wake notifications do not, check `allowed_senders` and LICC
+   delivery logs.
+
+## Agent guidance
+
+When setup fails, do not guess provider settings. Ask the human for the provider's
+IMAP/SMTP documentation or fetch it, then update the config and re-check status.
+"""
+
+
+def _onboarding_html_template() -> str:
+    return """<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <title>LingTai IMAP MCP setup</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 820px; margin: 40px auto; padding: 0 20px; line-height: 1.55; color: #1f2328; }
+    h1 { margin-bottom: 0.2rem; }
+    .warn { background: #fff8c5; border: 1px solid #d4a72c; border-radius: 8px; padding: 12px 14px; }
+    .ok { background: #dafbe1; border: 1px solid #4ac26b; border-radius: 8px; padding: 12px 14px; }
+    code, pre { background: #f6f8fa; border-radius: 6px; }
+    pre { padding: 14px; overflow-x: auto; }
+    li { margin: 0.35rem 0; }
+  </style>
+</head>
+<body>
+  <h1>LingTai IMAP MCP setup</h1>
+  <p class=\"warn\"><strong>Secret safety:</strong> do not paste real email passwords, app passwords, OAuth tokens, or recovery codes into this page. Use placeholders only.</p>
+  <h2>Provider settings</h2>
+  <ul>
+    <li>Email address: <code>{{EMAIL_ADDRESS}}</code></li>
+    <li>IMAP host/port: <code>{{IMAP_HOST}}</code>:<code>{{IMAP_PORT}}</code></li>
+    <li>SMTP host/port: <code>{{SMTP_HOST}}</code>:<code>{{SMTP_PORT}}</code></li>
+    <li>Credential type: <code>{{CREDENTIAL_TYPE}}</code></li>
+  </ul>
+  <h2>Checklist</h2>
+  <ol>
+    <li>Enable IMAP in the provider dashboard if required.</li>
+    <li>Create an app password or provider token; store it only in the local config/secret file.</li>
+    <li>Set <code>LINGTAI_IMAP_CONFIG</code> to the config JSON path.</li>
+    <li>Refresh the host agent.</li>
+    <li>Check <code>lingtai://status</code> and run <code>imap(action=&quot;accounts&quot;)</code>.</li>
+    <li>Test inbound with <code>imap(action=&quot;check&quot;)</code> and outbound with <code>imap(action=&quot;send&quot;)</code>.</li>
+  </ol>
+  <p class=\"ok\">This template is static and secret-free. The agent may replace placeholders with non-secret provider metadata before opening it locally for the human.</p>
+</body>
+</html>
+"""
+
+
 def lingtai_resources(manager: IMAPMailManager | None = None) -> dict[str, tuple[str, str]]:
     """Return MCP-owned LingTai resources as uri -> (mime_type, content)."""
     return {
@@ -328,6 +457,8 @@ def lingtai_resources(manager: IMAPMailManager | None = None) -> dict[str, tuple
         _CONFIG_DOC_URI: (MARKDOWN_MIME, _configuration_markdown()),
         _TROUBLESHOOTING_DOC_URI: (MARKDOWN_MIME, _troubleshooting_markdown()),
         _STATUS_URI: (JSON_MIME, _json_dumps(_safe_status_payload(manager))),
+        _ONBOARDING_URI: (MARKDOWN_MIME, _onboarding_markdown()),
+        _ONBOARDING_HTML_TEMPLATE_URI: ("text/html", _onboarding_html_template()),
     }
 
 
