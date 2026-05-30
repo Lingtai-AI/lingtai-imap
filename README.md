@@ -133,7 +133,7 @@ Then run `system(action="refresh")` from the agent. The MCP subprocess starts, t
 
 ## License
 
-MIT.
+Apache-2.0.
 
 
 ## Onboarding resources
