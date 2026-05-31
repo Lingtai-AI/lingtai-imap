@@ -118,6 +118,20 @@ class _ClientFactory:
         return client
 
 
+class _RecordingStopEvent:
+    """Stop-event stand-in that records reconnect wait delays."""
+
+    def __init__(self):
+        self.delays: list[float] = []
+
+    def is_set(self):
+        return False
+
+    def wait(self, delay):
+        self.delays.append(delay)
+        return False
+
+
 def _make_account() -> IMAPAccount:
     return IMAPAccount(
         email_address="user@example.com",
@@ -218,6 +232,37 @@ class StaleConnectionTests(unittest.TestCase):
             # itself must have succeeded after reconnect.
             self.assertEqual(envelopes, [])
             self.assertEqual(len(factory.created), 2)
+
+    def test_listener_backoff_advances_when_idle_fails_immediately(self):
+        """Successful connect followed by IDLE failure must not reset backoff."""
+        acct = _make_account()
+        stop_event = _RecordingStopEvent()
+        acct._stop_event = stop_event
+        acct._backoff_steps = [1, 2, 5, 10]
+
+        connect_calls = []
+        disconnect_calls = []
+
+        def connect(folder):
+            connect_calls.append(folder)
+
+        def reconcile(folder):
+            return []
+
+        def idle_session(folder, on_message):
+            raise socket.error("idle EOF")
+
+        acct._connect_listener = connect
+        acct.reconcile = reconcile
+        acct._idle_session = idle_session
+        acct._disconnect_listener = lambda: disconnect_calls.append(True)
+
+        acct._run_listener_loop("INBOX", lambda envelopes: None, max_iterations=3)
+
+        self.assertEqual(connect_calls, ["INBOX", "INBOX", "INBOX"])
+        self.assertEqual(stop_event.delays, [1, 2, 5])
+        self.assertEqual(acct._backoff_index, 3)
+        self.assertEqual(len(disconnect_calls), 3)
 
 
 if __name__ == "__main__":
