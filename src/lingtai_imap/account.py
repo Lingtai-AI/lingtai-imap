@@ -873,7 +873,6 @@ class IMAPAccount:
             iterations += 1
             try:
                 self._connect_listener(folder)
-                self._backoff_index = 0
                 # Catch up on anything that arrived while we were down
                 envelopes = self.reconcile(folder)
                 if envelopes:
@@ -881,6 +880,10 @@ class IMAPAccount:
                 if self._stop_event.is_set():
                     return
                 self._idle_session(folder, on_message)
+                # Reset backoff only after a complete successful listener
+                # cycle. A connection that succeeds but immediately fails
+                # in IDLE should still advance the reconnect backoff.
+                self._backoff_index = 0
             except (socket.error, OSError, IMAPClientError) as e:
                 logger.warning(
                     "listener error on %s: %s", self._email_address, e,
